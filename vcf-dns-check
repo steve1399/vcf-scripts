@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# Discover this Linux host's DNS settings and compare credential-file FQDNs.
+# Dependencies: Python 3 and dig (Ubuntu package: dnsutils).
+#
+#
+# steve1399@gmail.com
+#
+set -euo pipefail
+command -v python3 >/dev/null 2>&1 || { echo 'Python 3 is required.' >&2; exit 2; }
+exec python3 - "$@" <<'PYTHON'
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+parser = argparse.ArgumentParser(description='Resolve credential FQDNs and compare configured DNS servers.')
+parser.add_argument('file', nargs='?', help='Explicit credential JSON file; default: scan current directory')
+parser.add_argument('--interface', help='Limit DNS discovery to one interface, useful on multi-link hosts')
+parser.add_argument('-v', '--verbose', action='store_true', help='Show DNS configuration, per-server answers, and SOA details')
+args = parser.parse_args()
+env = dict(os.environ, LC_ALL='C', SYSTEMD_COLORS='0', SYSTEMD_PAGER='cat')
+
+def clean(value):
+    return ''.join(c if c.isprintable() else '?' for c in str(value))
+
+def run(command):
+    try:
+        r = subprocess.run(command, capture_output=True, text=True, env=env, timeout=15)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 1, '', str(error)
+
+def unique(items):
+    return list(dict.fromkeys(items))
+
+def discover():
+    servers, domains = [], []
+    method = ''
+    if shutil.which('resolvectl'):
+        suffix = [args.interface] if args.interface else []
+        code, output, _ = run(['resolvectl', 'dns'] + suffix)
+        if code == 0:
+            for line in output.splitlines():
+                if ':' not in line:
+                    continue
+                for token in line.split(':', 1)[1].split():
+                    # resolved can attach an interface scope or TLS server name.
+                    token = token.split('#', 1)[0]
+                    try:
+                        ipaddress.ip_address(token.split('%', 1)[0])
+                        servers.append(token)
+                    except ValueError:
+                        pass
+        code, output, _ = run(['resolvectl', 'domain'] + suffix)
+        if code == 0:
+            domains = [token for line in output.splitlines() if ':' in line
+                       for token in line.split(':', 1)[1].split()]
+        if servers:
+            method = 'systemd-resolved (resolvectl)'
+    if not servers and shutil.which('nmcli'):
+        suffix = [args.interface] if args.interface else []
+        code, output, _ = run(['nmcli', '-t', '-f', 'IP4.DNS,IP6.DNS,IP4.DOMAIN,IP6.DOMAIN',
+                              'device', 'show'] + suffix)
+        if code == 0:
+            for line in output.splitlines():
+                key, _, value = line.partition(':')
+                value = value.replace('\\:', ':').strip()
+                if '.DNS' in key and value:
+                    servers.append(value)
+                elif '.DOMAIN' in key and value:
+                    domains.append(value)
+        if servers:
+            method = 'NetworkManager (nmcli)'
+    if not servers and not args.interface:
+        # A final fallback for hosts without resolved or NetworkManager.
+        try:
+            for line in Path('/etc/resolv.conf').read_text().splitlines():
+                words = line.split('#', 1)[0].split()
+                if words and words[0] == 'nameserver' and len(words) > 1:
+                    servers.append(words[1])
+                elif words and words[0] in ('search', 'domain'):
+                    domains.extend(words[1:])
+            method = '/etc/resolv.conf fallback'
+        except OSError:
+            pass
+    # Local stubs cannot establish that separate upstream servers agree.
+    servers = [s for s in unique(servers)
+               if not ipaddress.ip_address(s.split('%', 1)[0]).is_loopback]
+    return servers, unique(domains), method
+
+def load_names():
+    paths = [Path(args.file).expanduser()] if args.file else sorted(
+        p for p in Path.cwd().iterdir() if p.is_file() and p.suffix.lower() == '.json')
+    names, files, errors = [], [], []
+    for path in paths:
+        try:
+            if not args.file:
+                with path.open(encoding='utf-8-sig') as source:
+                    prefix = source.read(4096)
+                if not re.match(r'^\s*\{\s*"components"\s*:\s*\[', prefix):
+                    continue
+            data = json.loads(path.read_text(encoding='utf-8-sig'))
+            if not isinstance(data, dict) or not isinstance(data.get('components'), list):
+                raise ValueError('Expected a components array')
+            for component in data['components']:
+                if not isinstance(component, dict):
+                    raise ValueError('Each component must be an object')
+                name = component.get('FQDN', '')
+                if not name:
+                    continue
+                if not isinstance(name, str):
+                    raise ValueError('FQDN must be a string')
+                name = name.strip().rstrip('.').lower()
+                if (len(name) > 253 or '.' not in name or
+                    any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                        for label in name.split('.'))):
+                    raise ValueError('Invalid FQDN: ' + clean(name))
+                names.append(name)
+            files.append(str(path))
+        except (OSError, UnicodeError, ValueError) as error:
+            errors.append(f'{clean(path)}: {clean(error)}')
+    return sorted(set(names)), files, errors
+
+cache = {}
+def query(server, name, kind, recursive=True):
+    key = server, name, kind, recursive
+    if key in cache:
+        return cache[key]
+    command = ['dig', '-r']  # Ignore personal .digrc options for predictable parsing.
+    if server:
+        command.append('@' + server)
+    command += [name + '.', kind, '+time=2', '+tries=1', '+noall', '+comments',
+                '+answer', '+authority', '+nomultiline', '+recurse' if recursive else '+norecurse']
+    code, output, error = run(command)
+    match = re.search(r'status:\s*(\w+)', output)
+    status = match.group(1) if match else 'ERROR'
+    flags = re.search(r';; flags:\s*([^;]+)', output)
+    aa = bool(flags and 'aa' in flags.group(1).split())
+    records, section = [], None
+    for line in output.splitlines():
+        if line.startswith(';; ANSWER SECTION:'):
+            section = 'answer'
+        elif line.startswith(';; AUTHORITY SECTION:'):
+            section = 'authority'
+        elif line.startswith(';') or not line.strip():
+            continue
+        else:
+            fields = line.split()
+            if section and len(fields) >= 5 and fields[2] == 'IN':
+                records.append((section, fields[0].rstrip('.').lower(), fields[3], tuple(fields[4:])))
+    result = {'status': status if code == 0 else 'ERROR', 'aa': aa, 'records': records}
+    cache[key] = result
+    return result
+
+def addresses(results):
+    return sorted({values[0] for result in results for section, _, kind, values in result['records']
+                   if section == 'answer' and kind in ('A', 'AAAA')})
+
+def signature(results):
+    # Compare status and answer content; TTLs and ordering are deliberately ignored.
+    return tuple((r['status'], tuple(sorted(
+        (owner, kind, tuple(v.lower() if kind == 'CNAME' else v for v in values))
+        for section, owner, kind, values in r['records'] if section == 'answer')))
+        for r in results)
+
+def find_zone(name, servers):
+    # Ask each configured server, so a working secondary can reveal the zone.
+    for server in servers:
+        result = query(server, name, 'SOA', False)
+        candidates = [owner for _, owner, kind, _ in result['records']
+                      if kind == 'SOA' and owner and (name == owner or name.endswith('.' + owner))]
+        if candidates:
+            return max(candidates, key=len)
+    # Positive answers to SOA-at-host may omit the enclosing zone.
+    labels = name.split('.')
+    for offset in range(1, len(labels) - 1):
+        candidate = '.'.join(labels[offset:])
+        for server in servers:
+            result = query(server, candidate, 'SOA', False)
+            if any(owner == candidate and kind == 'SOA' for _, owner, kind, _ in result['records']):
+                return candidate
+    return None
+
+if not shutil.which('dig'):
+    sys.exit('dig is required. On Ubuntu: sudo apt install dnsutils')
+try:
+    names, files, errors = load_names()
+    servers, domains, method = discover()
+except (OSError, ValueError) as error:
+    sys.exit(clean(error))
+for error in errors:
+    print('JSON ERROR: ' + error, file=sys.stderr)
+if not names:
+    sys.exit('No credential FQDNs found in ' + clean(args.file or Path.cwd()))
+if not servers:
+    sys.exit('No upstream DNS servers discovered. Inspect resolvectl status or nmcli device show.')
+
+if args.verbose:
+    print('DNS configuration: ' + method)
+    print('DNS servers: ' + ', '.join(servers))
+    print('Search / routing domains: ' + (', '.join(domains) or '(none)'))
+    print('Credential files: ' + ', '.join(clean(f) for f in files))
+    print('Server numbers follow discovery order, not DNS primary/secondary roles.\n')
+
+failed = bool(errors)
+incomplete = len(servers) < 2
+width = max(len('FQDN'), *(len(n) for n in names))
+print(f'{"FQDN":<{width}}  RESULT       IP ADDRESS(ES)')
+print('-' * (width + 52))
+zones = {}
+for name in names:
+    local = [query(None, name, kind) for kind in ('A', 'AAAA')]
+    direct = [[query(server, name, kind) for kind in ('A', 'AAAA')] for server in servers]
+    local_ok = all(r['status'] == 'NOERROR' for r in local) and bool(addresses(local))
+    direct_ok = all(all(r['status'] == 'NOERROR' for r in pair) and addresses(pair) for pair in direct)
+    same = len({signature(pair) for pair in direct}) == 1
+    local_same = signature(local) == signature(direct[0])
+    if not local_ok or not direct_ok:
+        verdict = 'FAIL'
+        failed = True
+    elif not same or not local_same:
+        verdict = 'MISMATCH'
+        failed = True
+    elif len(servers) < 2:
+        verdict = 'ONE SERVER'
+    else:
+        verdict = 'MATCH'
+    print(f'{name:<{width}}  {verdict:<11}  {", ".join(addresses(local)) or "(unresolved)"}')
+    if args.verbose:
+        if verdict in ('FAIL', 'MISMATCH', 'ONE SERVER'):
+            print('  Host resolver: ' + ', '.join(
+                f'{kind}={r["status"]}' for kind, r in zip(('A', 'AAAA'), local)))
+        for index, (server, pair) in enumerate(zip(servers, direct), 1):
+            print(f'  DNS{index} {server}: Resolves to {", ".join(addresses(pair)) or "(no IP)"}')
+            if any(r['status'] != 'NOERROR' for r in pair):
+                print('    Query status: ' + ', '.join(
+                    f'{kind}={r["status"]}' for kind, r in zip(('A', 'AAAA'), pair)))
+    zone = find_zone(name, servers)
+    if zone:
+        zones[zone] = True
+    else:
+        incomplete = True
+        if args.verbose:
+            print('  SOA: zone could not be identified; authoritative sync cannot be confirmed.')
+
+if args.verbose:
+    print('\nAuthoritative zone checks (direct SOA queries, recursion disabled):')
+else:
+    print()
+for zone in sorted(zones):
+    serials = []
+    for index, server in enumerate(servers, 1):
+        result = query(server, zone, 'SOA', False)
+        soa = [v for section, owner, kind, v in result['records']
+               if section == 'answer' and owner == zone and kind == 'SOA' and len(v) >= 3]
+        serial = soa[0][2] if soa else None
+        authoritative = result['status'] == 'NOERROR' and result['aa'] and serial is not None
+        serials.append(serial if authoritative else None)
+        if args.verbose:
+            print(f'  {zone} DNS{index} {server}: serial={serial or "unavailable"}; '
+                  f'authoritative={"yes" if authoritative else "no"}; status={result["status"]}')
+    if len(servers) < 2 or any(s is None for s in serials):
+        incomplete = True
+        print(f'Zone sync: {zone} UNCONFIRMED (need two authoritative SOA replies)')
+    elif len(set(serials)) != 1:
+        failed = True
+        print(f'Zone sync: {zone} MISMATCH (authoritative SOA serials differ)')
+    else:
+        print(f'Zone sync: {zone} MATCH (serial {serials[0]})')
+
+if args.verbose:
+    print('\nScope: checks the listed FQDNs and zone serials, not every record in each zone.')
+if failed:
+    print('RESULT: FAIL — errors or mismatches found. Run with -v for details.')
+    sys.exit(1)
+if incomplete:
+    print('RESULT: INCOMPLETE — zone sync unconfirmed. Run with -v for details.')
+    sys.exit(2)
+print('RESULT: PASS — listed FQDN answers and authoritative SOA serials agree.')
+PYTHON

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Display installer credentials. Requires Python 3; no jq dependency.
+# Scan JSON files in the current directory, or pass one explicit file.
+#
+#
+# steve1399@gmail.com
+#
+set -euo pipefail
+
+if [[ ${1:-} == -h || ${1:-} == --help ]]; then
+    cat <<'HELP'
+Usage: vcf-creds [credentials.json]
+
+Print component names, FQDNs, usernames, passwords, and credential types.
+Default: scan all *.json files in the current directory (not recursively).
+Only files beginning with a components array are treated as credential files.
+Pass a file explicitly to read it directly.
+HELP
+    exit 0
+fi
+if (( $# > 1 )); then
+    printf 'Usage: vcf-creds [credentials.json]\n' >&2
+    exit 2
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    printf 'Error: Python 3 is required. Install it with: sudo apt install python3\n' >&2
+    exit 1
+fi
+
+exec python3 - "$@" <<'PYTHON'
+import json
+import re
+import sys
+from pathlib import Path
+
+def display(value):
+    # Prevent control characters in input from changing terminal behavior.
+    text = str(value)
+    return ''.join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+def read_groups(path):
+    data = json.loads(path.read_text(encoding='utf-8-sig'))
+    if not isinstance(data, dict) or not isinstance(data.get('components'), list):
+        raise ValueError('Expected a JSON object containing a components array')
+    groups = []
+    for component in data['components']:
+        if not isinstance(component, dict):
+            raise ValueError('Each component must be a JSON object')
+        credentials = component.get('credentials', [])
+        if not isinstance(credentials, list):
+            raise ValueError('Component credentials must be an array')
+        rows = []
+        for credential in credentials:
+            if not isinstance(credential, dict):
+                raise ValueError('Each credential must be a JSON object')
+            rows.append(tuple(display(credential.get(key, ''))
+                              for key in ('user', 'password', 'type')))
+        groups.append((display(component.get('componentName', 'Unnamed component')),
+                       display(component.get('FQDN', '')), rows))
+    return groups
+
+def print_groups(path, groups):
+    headers = ('USERNAME', 'PASSWORD', 'CREDENTIAL TYPE')
+    all_rows = [row for _, _, rows in groups for row in rows]
+    widths = [max([len(headers[i])] + [len(row[i]) for row in all_rows])
+              for i in range(3)]
+    def print_row(row):
+        print('  ' + '  '.join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+
+    print(f'Credentials: {display(path)}\n')
+    if not groups:
+        print('No components found.')
+    for name, fqdn, rows in groups:
+        print(name)
+        print(f'FQDN: {fqdn}')
+        if rows:
+            print_row(headers)
+            print_row(tuple('-' * width for width in widths))
+            for row in rows:
+                print_row(row)
+        else:
+            print('  No credentials found.')
+        print()
+
+explicit = len(sys.argv) > 1
+if explicit:
+    paths = [Path(sys.argv[1]).expanduser()]
+else:
+    paths = sorted((p for p in Path.cwd().iterdir()
+                    if p.is_file() and p.suffix.lower() == '.json'),
+                   key=lambda p: p.name.lower())
+
+shown = 0
+errors = 0
+for path in paths:
+    try:
+        if not explicit:
+            # Inspect only the opening text before loading a candidate file.
+            # Supports compact JSON, pretty printing, whitespace, and a UTF-8 BOM.
+            with path.open(encoding='utf-8-sig') as source:
+                prefix = source.read(4096)
+            if not re.match(r'^\s*\{\s*"components"\s*:\s*\[', prefix):
+                continue
+        groups = read_groups(path)
+        print_groups(path, groups)
+        shown += 1
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f'Error reading {display(path)}: {display(error)}', file=sys.stderr)
+        errors += 1
+
+if not shown and not explicit:
+    print(f'No matching credential JSON files found in {display(Path.cwd())}.')
+sys.exit(1 if errors else 0)
+PYTHON
